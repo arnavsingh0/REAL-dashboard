@@ -1,0 +1,12 @@
+#=====================================================================
+# backend/requirements.txt
+# =====================================================================
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pandas>=2.1
+requests>=2.31
+
+# Local dev:
+#   cd backend && pip install -r requirements.txt
+#   uvicorn main:app --reload --port 8000
+#   open http://localhost:8000/docs
