@@ -39,7 +39,8 @@ class Settings:
 
     # ── Server ──────────────────────────────────────────
     port: int = int(os.environ.get("PORT", "8000"))
-    allowed_origins: str = os.environ.get("ALLOWED_ORIGINS", "*")
+    # Comma-separated; no spaces. If unset, main.py defaults to Render dashboard + localhost.
+    allowed_origins: str = os.environ.get("ALLOWED_ORIGINS", "")
 
 
 settings = Settings()

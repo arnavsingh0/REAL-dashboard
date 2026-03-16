@@ -50,12 +50,22 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# CORS: explicit origins required when using credentials. Strip spaces; default to Render dashboard.
+_origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
+if not _origins or _origins == ["*"]:
+    _origins = [
+        "https://real-cubesat-dashboard.onrender.com",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.allowed_origins.split(","),
+    allow_origins=_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 
