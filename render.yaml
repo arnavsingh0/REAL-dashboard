@@ -14,7 +14,7 @@
       - key: JHUAPL_PASS
         sync: false
       - key: CACHE_TTL_SEC
-        value: "300"
+        value: "1800"
       - key: NORAD_ID
         value: "64875"
       - key: ALLOWED_ORIGINS

@@ -11,6 +11,7 @@ import re
 import logging
 from io import StringIO
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
@@ -52,94 +53,152 @@ def iso_z(dt) -> str:
 
 def fetch_jhuapl(start: str, end: str) -> pd.DataFrame:
     """
-    Fetch CSVs from JHUAPL's date-indexed flight_data directories.
-
-    Directory structure:
-        /flight_data/20250930/
-        /flight_data/20251001/
-        ...
-    Each contains CSV files with parsed telemetry.
+    Raw hex telemetry from JHUAPL — skipped because JHUAPL serves
+    Level-1 processed CSVs (no payload_hex column).
+    Use fetch_jhuapl_l1() / the /api/jhuapl/* endpoints instead.
     """
+    logger.info("JHUAPL raw hex fetch skipped (L1 CSVs have no payload_hex; use JHUAPL L1 tab)")
+    return pd.DataFrame(columns=RAW_COLUMNS)
+
+
+# ── JHUAPL Level-1 fetcher (already-decoded science CSVs) ────────
+
+def _list_jhuapl_day(day_str: str, base: str, auth: tuple) -> list[tuple[str, str]]:
+    """Get CSV filenames for one day. Returns [(dataset_key, csv_name), ...]."""
+    day_url = f"{base}/{day_str}/"
+    try:
+        resp = requests.get(day_url, auth=auth, timeout=10)
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+        csv_links = re.findall(r'href="([^"]*\.csv)"', resp.text, re.IGNORECASE)
+        results = []
+        for csv_name in csv_links:
+            key = csv_name.rsplit(".", 1)[0]
+            if re.match(r"^\d{8}_", key):
+                key = key[9:]
+            results.append((key, csv_name))
+        return results
+    except Exception as e:
+        logger.warning("Failed dir listing %s: %s", f"{base}/{day_str}/", e)
+        return []
+
+
+def _download_csv(url: str, auth: tuple) -> pd.DataFrame | None:
+    """Download and parse a single CSV into a DataFrame."""
+    try:
+        resp = requests.get(url, auth=auth, timeout=30)
+        resp.raise_for_status()
+        df = pd.read_csv(StringIO(resp.text))
+        if df.empty:
+            return None
+
+        lower_cols = {c.lower().strip(): c for c in df.columns}
+        ts_col = None
+        for candidate in ["utc", "timestamp", "time_tag", "time", "created"]:
+            if candidate in lower_cols:
+                ts_col = lower_cols[candidate]
+                break
+        if ts_col:
+            df = df.rename(columns={ts_col: "timestamp"})
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            df = df.dropna(subset=["timestamp"])
+
+        return df
+    except Exception as e:
+        logger.warning("Failed CSV %s: %s", url, e)
+        return None
+
+
+def get_jhuapl_l1_listings(start: str, end: str) -> dict:
+    """
+    Phase 1: Just get directory listings (fast, no CSV downloads).
+    Returns {dataset_names: [str], by_day: {day: [(key, csv_name)]}}
+    """
+    cache_key = f"jhuapl_listings:{start}:{end}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     auth = (settings.jhuapl_user, settings.jhuapl_pass)
     base = settings.jhuapl_base_url.rstrip("/")
 
     start_dt = pd.to_datetime(start, utc=True, errors="coerce")
     end_dt = pd.to_datetime(end, utc=True, errors="coerce")
-
     if pd.isna(start_dt) or pd.isna(end_dt):
-        logger.warning("Invalid date range for JHUAPL fetch: %s → %s", start, end)
-        return pd.DataFrame(columns=RAW_COLUMNS)
+        return {"dataset_names": [], "by_day": {}}
 
-    all_frames = []
+    days = []
     current = start_dt
-
     while current <= end_dt:
-        day_str = current.strftime("%Y%m%d")
-        day_url = f"{base}/{day_str}/"
-
-        try:
-            resp = requests.get(day_url, auth=auth, timeout=30)
-            if resp.status_code == 404:
-                current += timedelta(days=1)
-                continue
-            resp.raise_for_status()
-
-            # Parse directory listing for CSV links
-            csv_links = re.findall(r'href="([^"]*\.csv)"', resp.text, re.IGNORECASE)
-
-            for csv_name in csv_links:
-                # Skip quicklook or non-telemetry files if needed
-                csv_url = f"{day_url}{csv_name}"
-
-                try:
-                    csv_resp = requests.get(csv_url, auth=auth, timeout=60)
-                    csv_resp.raise_for_status()
-
-                    df = pd.read_csv(StringIO(csv_resp.text))
-
-                    # ── Column mapping ──────────────────────────────
-                    # JHUAPL CSVs may use different column names.
-                    # Adapt this mapping based on actual file headers.
-                    # Common patterns from the Autoplot instructions:
-                    #   utc, payload_hex, frame, etc.
-
-                    col_map = {}
-                    lower_cols = {c.lower().strip(): c for c in df.columns}
-
-                    # timestamp
-                    for candidate in ["utc", "timestamp", "time", "created"]:
-                        if candidate in lower_cols:
-                            col_map[lower_cols[candidate]] = "timestamp"
-                            break
-
-                    # payload hex
-                    for candidate in ["payload_hex", "frame", "payload", "raw_hex", "hex"]:
-                        if candidate in lower_cols:
-                            col_map[lower_cols[candidate]] = "payload_hex"
-                            break
-
-                    if "timestamp" not in col_map.values() or "payload_hex" not in col_map.values():
-                        # Not a raw telemetry CSV — skip
-                        continue
-
-                    df = df.rename(columns=col_map)
-                    df["station_id"] = "JHUAPL"
-                    df["station_name"] = f"JHUAPL/{csv_name}"
-
-                    all_frames.append(df)
-                    logger.debug("Fetched %s: %d rows", csv_url, len(df))
-
-                except Exception as e:
-                    logger.warning("Failed CSV %s: %s", csv_url, e)
-
-        except Exception as e:
-            logger.warning("Failed dir listing %s: %s", day_url, e)
-
+        days.append(current.strftime("%Y%m%d"))
         current += timedelta(days=1)
 
-    if all_frames:
-        return normalize_raw(pd.concat(all_frames, ignore_index=True))
-    return pd.DataFrame(columns=RAW_COLUMNS)
+    logger.info("JHUAPL L1 listings: scanning %d days", len(days))
+
+    by_day: dict[str, list[tuple[str, str]]] = {}
+    all_keys: set[str] = set()
+
+    with ThreadPoolExecutor(max_workers=min(10, len(days))) as pool:
+        futures = {pool.submit(_list_jhuapl_day, d, base, auth): d for d in days}
+        for future in as_completed(futures):
+            day = futures[future]
+            entries = future.result()
+            if entries:
+                by_day[day] = entries
+                all_keys.update(k for k, _ in entries)
+
+    result = {"dataset_names": sorted(all_keys), "by_day": by_day}
+    cache.set(cache_key, result, ttl=settings.cache_ttl_sec)
+    logger.info("JHUAPL L1 listings: %d datasets across %d days", len(all_keys), len(by_day))
+    return result
+
+
+def get_jhuapl_l1_dataset(start: str, end: str, dataset: str) -> pd.DataFrame:
+    """
+    Phase 2: Download CSVs for ONE specific dataset type (lazy).
+    Much faster than downloading everything upfront.
+    """
+    cache_key = f"jhuapl_ds:{start}:{end}:{dataset}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        logger.info("Cache hit: %s", cache_key)
+        return cached
+
+    listings = get_jhuapl_l1_listings(start, end)
+    auth = (settings.jhuapl_user, settings.jhuapl_pass)
+    base = settings.jhuapl_base_url.rstrip("/")
+
+    urls = []
+    for day, entries in listings["by_day"].items():
+        for key, csv_name in entries:
+            if key == dataset:
+                urls.append(f"{base}/{day}/{csv_name}")
+
+    if not urls:
+        logger.info("JHUAPL L1 dataset %s: no CSVs found", dataset)
+        return pd.DataFrame()
+
+    logger.info("JHUAPL L1 dataset %s: downloading %d CSVs", dataset, len(urls))
+
+    frames = []
+    with ThreadPoolExecutor(max_workers=min(6, len(urls))) as pool:
+        futures = [pool.submit(_download_csv, u, auth) for u in urls]
+        for future in as_completed(futures):
+            df = future.result()
+            if df is not None:
+                frames.append(df)
+
+    if not frames:
+        result = pd.DataFrame()
+    else:
+        result = pd.concat(frames, ignore_index=True)
+        if "timestamp" in result.columns:
+            result = result.sort_values("timestamp").reset_index(drop=True)
+
+    cache.set(cache_key, result, ttl=settings.cache_ttl_sec)
+    logger.info("JHUAPL L1 dataset %s: %d rows", dataset, len(result))
+    return result
 
 
 # ── SatNOGS fetcher ────────────────────────────────────────────────
@@ -149,8 +208,8 @@ def fetch_satnogs(start: str, end: str) -> pd.DataFrame:
     Fetch telemetry from SatNOGS DB API in 7-day chunks.
     Direct port of the notebook's chunked fetcher — no local storage.
     """
-    if not settings.satnogs_token:
-        logger.warning("SatNOGS fetch skipped: no token configured")
+    if not settings.satnogs_token or len(settings.satnogs_token) < 10:
+        logger.warning("SatNOGS fetch skipped: no valid token configured")
         return pd.DataFrame(columns=RAW_COLUMNS)
 
     session = requests.Session()
@@ -190,7 +249,10 @@ def fetch_satnogs(start: str, end: str) -> pd.DataFrame:
             page = None
             for attempt in range(settings.max_retries):
                 try:
-                    resp = session.get(url, params=params, timeout=60)
+                    resp = session.get(url, params=params, timeout=30)
+                    if resp.status_code in (401, 403):
+                        logger.error("SatNOGS auth failed (%d) — check SATNOGS_TOKEN", resp.status_code)
+                        return pd.DataFrame(columns=RAW_COLUMNS)
                     if resp.status_code == 429:
                         wait = resp.headers.get("Retry-After")
                         wait = float(wait) if wait else settings.backoff_sec * (attempt + 1) * 2
@@ -203,7 +265,7 @@ def fetch_satnogs(start: str, end: str) -> pd.DataFrame:
                 except Exception as e:
                     logger.warning("SatNOGS attempt %d: %s", attempt + 1, e)
                     import time as _time
-                    _time.sleep(settings.backoff_sec * (attempt + 1))
+                    _time.sleep(min(settings.backoff_sec * (attempt + 1), 5))
 
             if page is None:
                 logger.error("SatNOGS chunk failed: %s → %s", iso_z(chunk_start), iso_z(chunk_end))

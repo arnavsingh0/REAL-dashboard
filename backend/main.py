@@ -24,18 +24,20 @@ Endpoints:
 """
 
 from __future__ import annotations
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+import numpy as np
 import pandas as pd
 
 from config import settings
 from fields import HEALTH_FIELDS, TIME_FIELDS, field_meta
 from cache import cache
-from fetcher import get_decoded_data
+from fetcher import get_decoded_data, get_jhuapl_l1_listings, get_jhuapl_l1_dataset
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -98,12 +100,24 @@ def df_to_json(
             out = out[out["timestamp"] <= et]
 
     if fields:
-        keep = ["timestamp", "station_name"] + [f for f in fields if f in out.columns]
+        keep = ["timestamp"]
+        if "station_name" in out.columns:
+            keep.append("station_name")
+        keep += [f for f in fields if f in out.columns and f not in keep]
         out = out[keep]
 
-    out = out.tail(limit)
-    out["timestamp"] = out["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    return out.where(out.notna(), None).to_dict(orient="records")
+    if len(out) > limit:
+        step = max(1, len(out) // limit)
+        out = out.iloc[::step].head(limit)
+
+    out["timestamp"] = out["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    out = out.replace([np.inf, -np.inf], np.nan)
+    records = out.to_dict(orient="records")
+    for rec in records:
+        for k, v in rec.items():
+            if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+                rec[k] = None
+    return records
 
 
 # ── Endpoints ───────────────────────────────────────────────────────
@@ -120,7 +134,7 @@ async def get_health(
     s, e = start or default_range()[0], end or default_range()[1]
     src = parse_sources(sources)
 
-    data = get_decoded_data(s, e, src)
+    data = await asyncio.to_thread(get_decoded_data, s, e, src)
     field_list = [f.strip() for f in fields.split(",")] if fields else None
     records = df_to_json(data["health_df"], field_list, s, e, limit)
 
@@ -144,7 +158,7 @@ async def get_time(
     s, e = start or default_range()[0], end or default_range()[1]
     src = parse_sources(sources)
 
-    data = get_decoded_data(s, e, src)
+    data = await asyncio.to_thread(get_decoded_data, s, e, src)
     field_list = [f.strip() for f in fields.split(",")] if fields else None
     records = df_to_json(data["time_df"], field_list, s, e, limit)
 
@@ -175,7 +189,7 @@ async def get_latest(
     """Return the most recent decoded value for every field."""
     s, e = default_range()
     src = parse_sources(sources)
-    data = get_decoded_data(s, e, src)
+    data = await asyncio.to_thread(get_decoded_data, s, e, src)
 
     result = {"health": {}, "time": {}}
 
@@ -217,7 +231,7 @@ async def get_stats(
     """Summary statistics for the requested window."""
     s, e = start or default_range()[0], end or default_range()[1]
     src = parse_sources(sources)
-    data = get_decoded_data(s, e, src)
+    data = await asyncio.to_thread(get_decoded_data, s, e, src)
 
     return {
         "date_range": {"start": s, "end": e},
@@ -234,6 +248,80 @@ async def clear_cache():
     """Manually invalidate all cached data."""
     count = cache.invalidate()
     return {"cleared": count, "message": f"Cleared {count} cache entries"}
+
+
+# ── JHUAPL Level-1 endpoints ─────────────────────────────────────────
+
+@app.get("/api/jhuapl/datasets")
+async def get_jhuapl_datasets(
+    start: str | None = Query(None),
+    end: str | None = Query(None),
+):
+    """List available JHUAPL L1 dataset names (fast — directory scan only)."""
+    s, e = start or default_range()[0], end or default_range()[1]
+    listings = await asyncio.to_thread(get_jhuapl_l1_listings, s, e)
+
+    datasets = []
+    for name in listings["dataset_names"]:
+        day_count = sum(
+            1 for entries in listings["by_day"].values()
+            if any(k == name for k, _ in entries)
+        )
+        datasets.append({"name": name, "days": day_count, "numeric_columns": []})
+
+    datasets.sort(key=lambda d: ("high_spectra" in d["name"], d["name"]))
+
+    return {"datasets": datasets}
+
+
+@app.get("/api/jhuapl/fields")
+async def get_jhuapl_fields(
+    dataset: str = Query(...),
+    start: str | None = Query(None),
+    end: str | None = Query(None),
+):
+    """Return column metadata for a specific JHUAPL L1 dataset (downloads CSVs)."""
+    s, e = start or default_range()[0], end or default_range()[1]
+    df = await asyncio.to_thread(get_jhuapl_l1_dataset, s, e, dataset)
+
+    fields = []
+    for col in df.columns:
+        if col.startswith("_") or col == "timestamp":
+            continue
+        fields.append({
+            "name": col,
+            "units": "",
+            "thresholds": {},
+            "signed": False,
+            "numeric": bool(pd.api.types.is_numeric_dtype(df[col])),
+        })
+
+    return {"fields": {dataset: fields}, "rows": len(df)}
+
+
+@app.get("/api/jhuapl/data")
+async def get_jhuapl_data(
+    dataset: str = Query(..., description="Dataset name, e.g. low_rates_L1"),
+    start: str | None = Query(None),
+    end: str | None = Query(None),
+    fields: str | None = Query(None),
+    limit: int = Query(10_000, ge=1, le=100_000),
+):
+    """Return data from a specific JHUAPL L1 dataset."""
+    s, e = start or default_range()[0], end or default_range()[1]
+    df = await asyncio.to_thread(get_jhuapl_l1_dataset, s, e, dataset)
+
+    if df.empty:
+        return {"count": 0, "dataset": dataset, "data": []}
+
+    field_list = [f.strip() for f in fields.split(",")] if fields else None
+    records = df_to_json(df, field_list, s, e, limit)
+
+    return {
+        "count": len(records),
+        "dataset": dataset,
+        "data": records,
+    }
 
 
 # ── Health check (for Render / Fly.io) ──────────────────────────────
