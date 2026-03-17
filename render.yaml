@@ -17,8 +17,7 @@
         value: "1800"
       - key: NORAD_ID
         value: "64875"
-      - key: ALLOWED_ORIGINS
-        value: "https://real-cubesat-dashboard.onrender.com,http://localhost:5173"
+      # CORS is now allow_origins=["*"] in main.py (no credentials needed)
     healthCheckPath: /health
 
   # ── Frontend (static React build) ────────────────────

@@ -1,14 +1,5 @@
 """
-backend/config.py — All settings from environment variables.
-No local file paths needed — this is a stateless proxy.
-
-Create a .env file for local dev, or set env vars in Render/Fly.io:
-
-    SATNOGS_TOKEN=your_db_satnogs_token
-    JHUAPL_USER=realscience
-    JHUAPL_PASS=burstorbust2025!
-    CACHE_TTL_SEC=300
-    NORAD_ID=64875
+backend/config.py — Settings optimized for Render free tier (512MB / 0.1 CPU).
 """
 
 from __future__ import annotations
@@ -30,17 +21,15 @@ class Settings:
     satnogs_url: str = "https://db.satnogs.org/api/telemetry/"
     norad_id: int = int(os.environ.get("NORAD_ID", "64875"))
     default_sync_days: int = 14
-    page_size: int = 500
-    max_retries: int = 10
+    page_size: int = 250
+    max_retries: int = 3
     backoff_sec: float = 1.0
 
     # ── Cache ───────────────────────────────────────────
-    cache_ttl_sec: int = int(os.environ.get("CACHE_TTL_SEC", "1800"))  # 30 min
+    cache_ttl_sec: int = int(os.environ.get("CACHE_TTL_SEC", "1800"))
 
     # ── Server ──────────────────────────────────────────
     port: int = int(os.environ.get("PORT", "8000"))
-    # Comma-separated; no spaces. If unset, main.py defaults to Render dashboard + localhost.
-    allowed_origins: str = os.environ.get("ALLOWED_ORIGINS", "")
 
 
 settings = Settings()

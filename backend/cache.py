@@ -1,39 +1,42 @@
 """
-Simple TTL-based in-memory cache.
-No disk, no database — data evicts after expiry and is re-fetched
-from upstream on the next request.
+Memory-bounded TTL cache for Render free tier (512MB).
 
-Thread-safe via a simple lock since FastAPI runs background tasks
-on a threadpool.
+Limits:
+  - Max 8 entries (prevents memory creep from many date-range combos)
+  - Evicts oldest entry when full
+  - Per-entry TTL still applies
 """
 
 from __future__ import annotations
+import gc
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
+
+MAX_ENTRIES = 8
 
 
 @dataclass
 class CacheEntry:
     value: Any
     expires_at: float
+    created_at: float
 
 
 class TTLCache:
-    """
-    Key-value cache with per-entry TTL.
-
-    Usage:
-        cache = TTLCache(default_ttl=300)
-        cache.set("satnogs:2026-01-01:2026-01-14", data)
-        result = cache.get("satnogs:2026-01-01:2026-01-14")
-    """
-
     def __init__(self, default_ttl: int = 300):
         self.default_ttl = default_ttl
         self._store: dict[str, CacheEntry] = {}
         self._lock = threading.Lock()
+
+    def _evict_expired(self) -> None:
+        now = time.time()
+        expired = [k for k, e in self._store.items() if now > e.expires_at]
+        for k in expired:
+            del self._store[k]
+        if expired:
+            gc.collect()
 
     def get(self, key: str) -> Any | None:
         with self._lock:
@@ -47,19 +50,29 @@ class TTLCache:
 
     def set(self, key: str, value: Any, ttl: int | None = None) -> None:
         with self._lock:
-            expires = time.time() + (ttl if ttl is not None else self.default_ttl)
-            self._store[key] = CacheEntry(value=value, expires_at=expires)
+            self._evict_expired()
+
+            # Evict oldest if at capacity
+            while len(self._store) >= MAX_ENTRIES:
+                oldest_key = min(self._store, key=lambda k: self._store[k].created_at)
+                del self._store[oldest_key]
+                gc.collect()
+
+            now = time.time()
+            expires = now + (ttl if ttl is not None else self.default_ttl)
+            self._store[key] = CacheEntry(value=value, expires_at=expires, created_at=now)
 
     def invalidate(self, prefix: str = "") -> int:
-        """Remove entries matching a key prefix. Returns count removed."""
         with self._lock:
             if not prefix:
                 count = len(self._store)
                 self._store.clear()
+                gc.collect()
                 return count
             keys = [k for k in self._store if k.startswith(prefix)]
             for k in keys:
                 del self._store[k]
+            gc.collect()
             return len(keys)
 
     def stats(self) -> dict:
@@ -67,9 +80,7 @@ class TTLCache:
             now = time.time()
             total = len(self._store)
             alive = sum(1 for e in self._store.values() if now <= e.expires_at)
-            return {"total_entries": total, "alive": alive, "expired": total - alive}
+            return {"total_entries": total, "alive": alive, "max": MAX_ENTRIES}
 
 
-# ── Global cache instance ───────────────────────────────────────────
-# TTL is set from config at import time in main.py; default 5 min
 cache = TTLCache(default_ttl=300)

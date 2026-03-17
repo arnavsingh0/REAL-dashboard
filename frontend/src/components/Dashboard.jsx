@@ -34,7 +34,7 @@ export default function Dashboard({
     setLoading(true);
     setError(null);
 
-    fetchJHUAPLData({ dataset: datasetKey, start, end, limit: 10000 })
+    fetchJHUAPLData({ dataset: datasetKey, start, end, limit: 2000 })
       .then(res => { if (!cancelled) setAllData(res.data || []); })
       .catch(e => { if (!cancelled) setError(e.message); })
       .finally(() => { if (!cancelled) setLoading(false); });
